@@ -75,8 +75,11 @@ async def analyze_video(
                      "avoid re-running the CLIP classifier here.",
     ),
 ):
+    print("🔥 ENTERED /api/video/analyze", flush=True)
+    print("ANALYZE 1: endpoint entered; multipart fields and upload parsed", flush=True)
     request_start = time.perf_counter()
 
+    print("ANALYZE 2: validating upload and request parameters", flush=True)
     if not check_ffmpeg_available():
         raise HTTPException(status_code=500, detail="ffmpeg/ffprobe not found on server")
     if not video.filename:
@@ -111,8 +114,9 @@ async def analyze_video(
     timing: dict = {}
 
     try:
+        print("ANALYZE 3: upload received; saving video", flush=True)
         # --- save upload ---
-        logger.info("analyze: saving upload '%s' to %s", video.filename, input_path)
+        logger.info("analyze: saving uploaded video to temporary storage")
         upload_start = time.perf_counter()
         try:
             with os.fdopen(input_fd, "wb") as f:
@@ -125,9 +129,11 @@ async def analyze_video(
             logger.exception("failed to save uploaded video")
             raise HTTPException(status_code=500, detail="failed to save uploaded video")
         timing["upload"] = round(time.perf_counter() - upload_start, 3)
+        print(f"ANALYZE 4: video saved ({timing['upload']:.2f}s)", flush=True)
         logger.info("analyze: upload saved (%.2fs)", timing["upload"])
 
         # --- make sure the requested window actually fits inside the source video ---
+        print("ANALYZE 5: starting FFmpeg/video duration probe", flush=True)
         logger.info("analyze: reading source video duration...")
         try:
             source_duration = await run_in_threadpool(get_duration, input_path)
@@ -135,6 +141,7 @@ async def analyze_video(
             logger.error("analyze: failed to read video duration: %s", e)
             raise HTTPException(status_code=500, detail=f"failed to read video: {e}")
         logger.info("analyze: source duration=%.2fs, requested window=%.2fs-%.2fs", source_duration, start, end)
+        print(f"ANALYZE 6: FFmpeg/video duration probe complete ({source_duration:.2f}s)", flush=True)
         if end > source_duration + DURATION_EPSILON:
             raise HTTPException(
                 status_code=400,
@@ -162,8 +169,10 @@ async def analyze_video(
         confidence: Optional[float] = None
         if skip_classification:
             timing["classify"] = 0.0
+            print("ANALYZE 7: classification skipped by request", flush=True)
             logger.info("analyze: skipping classification (skip_classification=true)")
         else:
+            print("ANALYZE 7: extracting classification frames", flush=True)
             logger.info("analyze: extracting %d frames for classification...", NUM_FRAMES)
             classify_start = time.perf_counter()
             classify_paths = await run_in_threadpool(
@@ -176,25 +185,32 @@ async def analyze_video(
             )
             if not classify_paths:
                 raise HTTPException(status_code=500, detail="failed to extract frames for classification")
+            print(f"ANALYZE 8: classification frames extracted ({len(classify_paths)} frames)", flush=True)
             logger.info("analyze: running Gemini classification on %d frames...", len(classify_paths))
             try:
+                print("ANALYZE 9: starting Gemini classification call", flush=True)
                 confidence, _per_frame = await run_in_threadpool(classify_frames, classify_paths)
             except Exception:
                 logger.exception("classification failed")
                 raise HTTPException(status_code=500, detail="failed to classify video")
             timing["classify"] = round(time.perf_counter() - classify_start, 3)
+            print(f"ANALYZE 10: Gemini classification complete ({timing['classify']:.2f}s)", flush=True)
             logger.info("analyze: classification complete (%.2fs, confidence=%.4f)", timing["classify"], confidence)
 
             if confidence < LOL_THRESHOLD:
                 timing["total"] = round(time.perf_counter() - request_start, 3)
                 logger.info("analyze: clip rejected, not League of Legends (confidence=%.4f)", confidence)
-                return AnalyzeResponse(
+                print("ANALYZE 11: clip rejected during classification", flush=True)
+                rejected_response = AnalyzeResponse(
                     is_league_of_legends=False,
                     classification_confidence=round(confidence, 4),
                     timing_seconds=timing,
                 )
+                print("ANALYZE 12: rejection response created", flush=True)
+                return rejected_response
 
         # --- Gemini coaching pipeline (only reached for clips that passed classification) ---
+        print("ANALYZE 11: extracting analysis frames", flush=True)
         logger.info("analyze: extracting frames for Gemini analysis at %s fps...", fps)
         frame_extraction_start = time.perf_counter()
         try:
@@ -212,12 +228,14 @@ async def analyze_video(
         if not analysis_paths:
             raise HTTPException(status_code=500, detail="no frames were extracted for analysis")
         timing["frame_extraction"] = round(time.perf_counter() - frame_extraction_start, 3)
+        print(f"ANALYZE 12: analysis frames extracted ({len(analysis_paths)} frames)", flush=True)
         logger.info(
             "analyze: extracted %d frames for analysis (%.2fs), starting Gemini pipeline (vision=%s, text=%s)...",
             len(analysis_paths), timing["frame_extraction"], vision_model, text_model,
         )
 
         try:
+            print("ANALYZE 13: starting Gemini coaching pipeline", flush=True)
             result = await run_in_threadpool(
                 run_coaching_pipeline, analysis_paths, fps, vision_model, text_model, gemini_timeout_seconds
             )
@@ -229,11 +247,13 @@ async def analyze_video(
             raise HTTPException(status_code=502, detail=f"Gemini analysis failed: {e}")
         timing["event_extraction"] = result["event_extraction_seconds"]
         timing["coaching"] = result["coaching_seconds"]
+        print("ANALYZE 14: Gemini coaching pipeline complete", flush=True)
         logger.info("analyze: Gemini pipeline complete")
 
+        print("ANALYZE 15: processing analysis result", flush=True)
         if not result["events_valid_json"]:
             logger.warning("analyze: stage 1 output wasn't valid JSON; raw text was passed through to stage 2")
-        logger.info("analyze: extracted events: %s", result["events"])
+        logger.info("analyze: analysis result received (events_valid_json=%s)", result["events_valid_json"])
         if not result["coaching_valid_json"]:
             logger.warning("analyze: stage 2 output wasn't valid JSON; returning raw text in 'coaching'")
 
@@ -246,7 +266,8 @@ async def analyze_video(
             "skipped" if confidence is None else f"{confidence:.4f}",
         )
 
-        return AnalyzeResponse(
+        print("ANALYZE 16: creating response", flush=True)
+        response = AnalyzeResponse(
             is_league_of_legends=True,
             classification_confidence=None if confidence is None else round(confidence, 4),
             classification_skipped=skip_classification,
@@ -254,6 +275,12 @@ async def analyze_video(
             coaching_valid_json=result["coaching_valid_json"],
             timing_seconds=timing,
         )
+        print("ANALYZE 17: response created", flush=True)
+        return response
+    except Exception:
+        print("ANALYZE ERROR: unhandled exception", flush=True)
+        logger.exception("analyze: unhandled exception")
+        raise
     finally:
         try:
             if os.path.exists(input_path):

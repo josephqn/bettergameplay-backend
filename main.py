@@ -12,6 +12,21 @@ from champion_detection import router as champion_detection_router
 
 app = FastAPI()
 
+
+@app.middleware("http")
+async def log_http_requests(request, call_next):
+    print(f"--> {request.method} {request.url.path}", flush=True)
+    try:
+        response = await call_next(request)
+    except Exception:
+        import traceback
+
+        print(f"HTTP request failed: {request.method} {request.url.path}", flush=True)
+        traceback.print_exc()
+        raise
+    print(f"<-- {request.method} {request.url.path} {response.status_code}", flush=True)
+    return response
+
 ALLOWED_ORIGINS = [
     "https://bettergameplay.com",
     "https://www.bettergameplay.com",
