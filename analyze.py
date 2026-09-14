@@ -174,7 +174,7 @@ async def analyze_video(
         else:
             print("ANALYZE 7: extracting classification frames", flush=True)
             logger.info("analyze: extracting %d frames for classification...", NUM_FRAMES)
-            classify_start = time.perf_counter()
+            classify_extract_start = time.perf_counter()
             classify_paths = await run_in_threadpool(
                 extract_frames_count,
                 input_path,
@@ -183,18 +183,37 @@ async def analyze_video(
                 clip_duration,
                 start,
             )
+            classify_extract_seconds = time.perf_counter() - classify_extract_start
             if not classify_paths:
                 raise HTTPException(status_code=500, detail="failed to extract frames for classification")
-            print(f"ANALYZE 8: classification frames extracted ({len(classify_paths)} frames)", flush=True)
+            logger.info(
+                "perf analyze: classification frame extraction=%.2fs frames=%d",
+                classify_extract_seconds, len(classify_paths),
+            )
+            print(
+                f"ANALYZE 8: classification frames extracted ({len(classify_paths)} frames, "
+                f"{classify_extract_seconds:.2f}s)",
+                flush=True,
+            )
             logger.info("analyze: running Gemini classification on %d frames...", len(classify_paths))
             try:
                 print("ANALYZE 9: starting Gemini classification call", flush=True)
+                classify_call_start = time.perf_counter()
                 confidence, _per_frame = await run_in_threadpool(classify_frames, classify_paths)
             except Exception:
                 logger.exception("classification failed")
                 raise HTTPException(status_code=500, detail="failed to classify video")
-            timing["classify"] = round(time.perf_counter() - classify_start, 3)
-            print(f"ANALYZE 10: Gemini classification complete ({timing['classify']:.2f}s)", flush=True)
+            classify_call_seconds = time.perf_counter() - classify_call_start
+            timing["classify"] = round(classify_extract_seconds + classify_call_seconds, 3)
+            logger.info(
+                "perf analyze: Gemini classification call=%.2fs total_classify=%.2fs confidence=%.4f",
+                classify_call_seconds, timing["classify"], confidence,
+            )
+            print(
+                f"ANALYZE 10: Gemini classification complete (call={classify_call_seconds:.2f}s, "
+                f"total={timing['classify']:.2f}s)",
+                flush=True,
+            )
             logger.info("analyze: classification complete (%.2fs, confidence=%.4f)", timing["classify"], confidence)
 
             if confidence < LOL_THRESHOLD:

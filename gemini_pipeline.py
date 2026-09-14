@@ -76,10 +76,16 @@ def call_gemini_text(client: genai.Client, model: str, prompt: str) -> str:
 def call_gemini_frames(client: genai.Client, model: str, prompt: str, frame_paths: List[str]) -> str:
     logger.info("calling Gemini vision model '%s' with %d frames...", model, len(frame_paths))
     parts = [prompt]
+    image_bytes = 0
     for fp in frame_paths:
         with open(fp, "rb") as f:
-            parts.append(types.Part.from_bytes(data=f.read(), mime_type="image/jpeg"))
-    logger.info("sending request to Gemini vision model '%s'...", model)
+            image_data = f.read()
+            image_bytes += len(image_data)
+            parts.append(types.Part.from_bytes(data=image_data, mime_type="image/jpeg"))
+    logger.info(
+        "perf gemini: vision request model='%s' frames=%d image_bytes=%d prompt_chars=%d",
+        model, len(frame_paths), image_bytes, len(prompt),
+    )
     call_start = time.perf_counter()
     try:
         response = client.models.generate_content(model=model, contents=parts)

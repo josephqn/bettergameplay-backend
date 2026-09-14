@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from typing import List, Optional
 
 logger = logging.getLogger("bettergameplay.video_utils")
@@ -108,10 +109,15 @@ def extract_frames_fps(
     if scale:
         vf_parts.append(scale)
     cmd += ["-vf", ",".join(vf_parts), "-q:v", "2", pattern]
+    extraction_start = time.perf_counter()
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
         raise FFmpegError(f"ffmpeg frame extraction failed: {result.stderr.decode(errors='ignore')}")
     names = sorted(f for f in os.listdir(out_dir) if f.startswith("frame_") and f.endswith(".jpg"))
+    logger.info(
+        "perf video: fps extraction=%.2fs fps=%s duration=%.2fs frames=%d max_width=%s",
+        time.perf_counter() - extraction_start, fps, duration or 0.0, len(names), max_width,
+    )
     return [os.path.join(out_dir, f) for f in names]
 
 
@@ -123,8 +129,8 @@ def extract_frames_count(
     start: float = 0.0,
     max_width: Optional[int] = CLASSIFY_FRAME_WIDTH,
 ) -> List[str]:
-    """Sample a fixed number of frames, evenly spaced across [start, start+duration]. Used for
-    the cheap CLIP classifier, which just needs a representative handful of frames.
+    """Sample a fixed number of frames across [start, start+duration] in one FFmpeg pass.
+    Used for the classifier, which just needs a representative handful of frames.
 
     `start` lets callers seek directly into a window of an untrimmed source video instead of
     requiring a pre-trimmed file. `duration`, if omitted, defaults to the remaining video length
@@ -135,26 +141,32 @@ def extract_frames_count(
     if duration is None:
         duration = get_duration(video_path) - start
     frame_paths = []
+    if count <= 0 or duration <= 0:
+        return frame_paths
+
     scale = _scale_filter(max_width)
-    for i in range(count):
-        timestamp = start + duration * (i + 0.5) / count
-        frame_path = os.path.join(out_dir, f"frame_{i:02d}.jpg")
-        cmd = [
-            "ffmpeg", "-nostdin", "-y",
-            "-ss", str(timestamp),
-            "-i", video_path,
-            "-frames:v", "1",
-        ]
-        if scale:
-            cmd += ["-vf", scale]
-        cmd += ["-q:v", "2", frame_path]
-        result = subprocess.run(cmd, capture_output=True)
-        if result.returncode != 0:
-            logger.warning(
-                "frame extraction failed at t=%.2fs: %s",
-                timestamp, result.stderr.decode(errors="ignore"),
-            )
-            continue
-        if os.path.exists(frame_path):
-            frame_paths.append(frame_path)
+    pattern = os.path.join(out_dir, "frame_%02d.jpg")
+    filters = [f"fps={count / duration}"]
+    if scale:
+        filters.append(scale)
+    cmd = [
+        "ffmpeg", "-nostdin", "-y",
+        "-ss", str(start),
+        "-i", video_path,
+        "-t", str(duration),
+        "-vf", ",".join(filters),
+        "-frames:v", str(count),
+        "-q:v", "3", pattern,
+    ]
+    extraction_start = time.perf_counter()
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        raise FFmpegError(f"ffmpeg frame extraction failed: {result.stderr.decode(errors='ignore')}")
+
+    names = sorted(f for f in os.listdir(out_dir) if f.startswith("frame_") and f.endswith(".jpg"))
+    logger.info(
+        "perf video: count extraction=%.2fs requested=%d duration=%.2fs frames=%d max_width=%s",
+        time.perf_counter() - extraction_start, count, duration, min(len(names), count), max_width,
+    )
+    frame_paths.extend(os.path.join(out_dir, name) for name in names[:count])
     return frame_paths
