@@ -1,7 +1,7 @@
 import os
 
 from dotenv import find_dotenv, load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv(find_dotenv(usecwd=True))  # reads a .env file in the current working directory (if present)
@@ -101,6 +101,32 @@ async def debug_upload(request: Request):
     return {
         "status": "ok",
         "endpoint": "debug_upload",
+        "bytes_received": total_bytes,
+        "chunks_received": chunks,
+    }
+
+
+@app.post("/api/debug/file-upload")
+async def debug_file_upload(video: UploadFile = File(...)):
+    print("DEBUG FILE UPLOAD 1: UploadFile parsed; endpoint reached", flush=True)
+    total_bytes = 0
+    chunks = 0
+    while True:
+        chunk = await video.read(1024 * 1024)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        chunks += 1
+        if chunks == 1:
+            print(f"DEBUG FILE UPLOAD 2: first file chunk read ({len(chunk)} bytes)", flush=True)
+
+    print(
+        f"DEBUG FILE UPLOAD 3: file read complete ({total_bytes} bytes, {chunks} chunks)",
+        flush=True,
+    )
+    return {
+        "status": "ok",
+        "endpoint": "debug_file_upload",
         "bytes_received": total_bytes,
         "chunks_received": chunks,
     }
