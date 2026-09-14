@@ -25,7 +25,7 @@ MAX_CLIP_DURATION = 20
 MIN_CLIP_DURATION = 1
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-logger = logging.getLogger("gamesense.trim")
+logger = logging.getLogger("bettergameplay.trim")
 
 
 def parse_args() -> argparse.Namespace:

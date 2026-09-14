@@ -1,5 +1,5 @@
 """analyze.py - combined endpoint. Upload a video plus a start/end window; the server seeks
-directly into that window of the upload to pull frames, runs them through the CLIP classifier
+directly into that window of the upload to pull frames, runs them through the Gemini classifier
 to confirm it's League of Legends, and - only if it passes classification - runs the window
 through the two-stage Gemini coaching pipeline.
 
@@ -40,7 +40,7 @@ DURATION_EPSILON = 0.05
 ANALYSIS_FPS = 4.0
 CHUNK_SIZE = 1024 * 1024
 
-logger = logging.getLogger("gamesense.analyze")
+logger = logging.getLogger("bettergameplay.analyze")
 
 router = APIRouter()
 
@@ -154,9 +154,9 @@ async def analyze_video(
                     detail=f"requested clip must be at least {MIN_CLIP_DURATION:.0f}s",
                 )
 
-        # --- classify (cheap, local CLIP model - gate before we spend any Gemini calls) ---
+        # --- classify with Gemini before running the coaching pipeline ---
         # Skippable when the caller already classified this clip (e.g. via /api/video/classify)
-        # to avoid running the CLIP model twice on the same footage.
+        # to avoid classifying the same footage twice.
         # Frames are pulled directly from the [start, end] window of the original upload --
         # no intermediate trimmed file is created; ffmpeg seeks straight to each timestamp.
         confidence: Optional[float] = None
@@ -176,7 +176,7 @@ async def analyze_video(
             )
             if not classify_paths:
                 raise HTTPException(status_code=500, detail="failed to extract frames for classification")
-            logger.info("analyze: running CLIP classification on %d frames...", len(classify_paths))
+            logger.info("analyze: running Gemini classification on %d frames...", len(classify_paths))
             try:
                 confidence, _per_frame = await run_in_threadpool(classify_frames, classify_paths)
             except Exception:

@@ -19,7 +19,7 @@ from prompts import event_detection_prompt, coaching_prompt
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_TIMEOUT_SECONDS = 120.0
 
-logger = logging.getLogger("gamesense.gemini_pipeline")
+logger = logging.getLogger("bettergameplay.gemini_pipeline")
 
 
 class GeminiRateLimitError(RuntimeError):

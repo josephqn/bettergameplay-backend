@@ -4,50 +4,19 @@ import tempfile
 import time
 from typing import List, Tuple
 
-import torch
-import open_clip
-from PIL import Image
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from video_utils import FFmpegError, extract_frames_count, get_duration
+from gemini_pipeline import DEFAULT_MODEL, build_client, call_gemini_frames, parse_json_block
 
-MODEL_NAME = "ViT-B-32-quickgelu"
-PRETRAINED = "openai"
 NUM_FRAMES = 5
 LOL_THRESHOLD = 0.5
 CHUNK_SIZE = 1024 * 1024
 
-CANDIDATE_LABELS = [
-    "a screenshot of a League of Legends match, top-down view with a minimap and ability icons",
-    "a screenshot of a first-person shooter video game",
-    "a screenshot of Fortnite gameplay",
-    "a screenshot of Rocket League gameplay",
-]
-LOL_INDEX = 0
-
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("gamesense.classify")
+logger = logging.getLogger("bettergameplay.classify")
 
 router = APIRouter()
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-_model_load_start = time.perf_counter()
-model, _, preprocess = open_clip.create_model_and_transforms(MODEL_NAME, pretrained=PRETRAINED)
-tokenizer = open_clip.get_tokenizer(MODEL_NAME)
-model.to(device)
-model.eval()
-
-with torch.no_grad():
-    text_tokens = tokenizer(CANDIDATE_LABELS).to(device)
-    text_features = model.encode_text(text_tokens)
-    text_features /= text_features.norm(dim=-1, keepdim=True)
-
-logger.info(
-    "CLIP model '%s' loaded on %s in %.2fs",
-    MODEL_NAME, device, time.perf_counter() - _model_load_start,
-)
-
 
 def _cleanup(*paths: str) -> None:
     for path in paths:
@@ -64,20 +33,36 @@ def _cleanup(*paths: str) -> None:
 
 
 def classify_frames(frame_paths: List[str]) -> Tuple[float, List[float]]:
-    """Run CLIP zero-shot classification over the given frames and return
-    (mean League-of-Legends confidence, per-frame scores). Shared by the standalone
-    /api/video/classify endpoint and the combined /api/video/analyze endpoint."""
-    images = [preprocess(Image.open(p).convert("RGB")) for p in frame_paths]
-    batch = torch.stack(images).to(device)
+    """Classify frames with Gemini and return mean and per-frame LoL confidence."""
+    prompt = """
+You are classifying video frames by game. Analyze every image supplied and return only valid JSON.
 
-    with torch.no_grad():
-        image_features = model.encode_image(batch)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
-        similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+For each frame, estimate the probability from 0.0 to 1.0 that it shows League of Legends gameplay.
+League of Legends gameplay is a top-down MOBA view with recognizable League UI such as a minimap,
+champion ability bar, health or mana bars, items, or lane/jungle terrain. Menus, loading screens,
+other games, unrelated images, and ambiguous frames should receive a low probability.
 
-    lol_scores = similarity[:, LOL_INDEX]
-    per_frame = [round(s, 4) for s in lol_scores.tolist()]
-    return float(lol_scores.mean()), per_frame
+Return exactly this JSON shape, with one value in per_frame_scores for each image in input order:
+{"per_frame_scores": [0.0], "confidence": 0.0}
+
+confidence must be the arithmetic mean of per_frame_scores. Do not include markdown or explanation.
+""".strip()
+    client = build_client()
+    raw_result = call_gemini_frames(client, DEFAULT_MODEL, prompt, frame_paths)
+    result, valid_json = parse_json_block(raw_result)
+    if not valid_json or not isinstance(result, dict):
+        raise RuntimeError("classification model returned invalid JSON")
+
+    raw_scores = result.get("per_frame_scores")
+    if not isinstance(raw_scores, list) or len(raw_scores) != len(frame_paths):
+        raise RuntimeError("classification model returned an invalid frame score count")
+    try:
+        per_frame = [round(max(0.0, min(1.0, float(score))), 4) for score in raw_scores]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("classification model returned invalid frame scores") from exc
+
+    confidence = round(sum(per_frame) / len(per_frame), 4)
+    return confidence, per_frame
 
 
 @router.post("/api/video/classify")

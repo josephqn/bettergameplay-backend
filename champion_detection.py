@@ -48,7 +48,7 @@ CHAMPION_DETECTION_FRAME_WIDTH = 1536
 # inspected afterward, so it's not deleted automatically.
 CHAMPION_DEBUG_ROOT = os.environ.get("CHAMPION_DEBUG_DIR", "champions_debug")
 
-logger = logging.getLogger("gamesense.champion_detection")
+logger = logging.getLogger("bettergameplay.champion_detection")
 
 router = APIRouter()
 

@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Tuple
 
 from PIL import Image, ImageDraw
 
-logger = logging.getLogger("gamesense.champion_debug")
+logger = logging.getLogger("bettergameplay.champion_debug")
 
 CIRCLE_RADIUS_PX = 14
 CIRCLE_WIDTH_PX = 3

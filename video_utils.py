@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from typing import List, Optional
 
-logger = logging.getLogger("gamesense.video_utils")
+logger = logging.getLogger("bettergameplay.video_utils")
 
 # Caps on extracted frame width (aspect ratio preserved, height rounded to even). Frames are
 # never upscaled past their source resolution -- these are ceilings, not fixed targets.
