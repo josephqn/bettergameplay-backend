@@ -1,0 +1,80 @@
+[
+  {
+    "is_league_of_legends": true,
+    "classification_confidence": 0.9824,
+    "classification_skipped": false,
+    "coaching": "{\n  \"good_plays\": [\n    {\n      \"text\": \"There wasn't much positive counterplay in this short clip to highlight, as you were quickly locked down and overwhelmed.\",\n      \"start_frame\": 0,\n      \"end_frame\": 4\n    }\n  ],\n  \"mistakes\": [\n    {\n      \"text\": \"When the first enemy champion engaged and stunned you, you remained vulnerable to follow-up damage and a second enemy's area-of-effect ability leading to your death.\",\n      \"start_frame\": 6,\n      \"end_frame\": 17\n    }\n  ],\n  \"action_items\": {\n    \"keep_doing_this\": \"Keep your initial movement intentional as you move up the lane.\",\n    \"focus_on_this_next\": \"React immediately to enemy engagement by tracking incoming threats before getting locked down by crowd control.\"\n  }\n}",
+    "timing_seconds": {
+      "upload": 1.086,
+      "trim": 6.702,
+      "classify": 1.462,
+      "frame_extraction": 0.665,
+      "event_extraction": 12.076,
+      "coaching": 1.122,
+      "total": 23.26
+    }
+  },
+
+  {
+    "is_league_of_legends": true,
+    "classification_confidence": 0.984,
+    "classification_skipped": false,
+    "coaching": "{\n  \"good_plays\": [\n    {\n      \"text\": \"There wasn't much positive counterplay in this short clip to highlight, as you were quickly caught out.\",\n      \"start_frame\": 0,\n      \"end_frame\": 6\n    }\n  ],\n  \"mistakes\": [\n    {\n      \"text\": \"You moved forward into the lane without accounting for the enemy, letting them catch you with crowd control and deal heavy damage before you could escape.\",\n      \"start_frame\": 0,\n      \"end_frame\": 17\n    }\n  ],\n  \"action_items\": {\n    \"keep_doing_this\": \"Keep your initial movement purposeful as you head out into the lane.\",\n    \"focus_on_this_next\": \"Respect enemy engagement ranges when moving forward so you don't get caught out and locked down immediately.\"\n  }\n}",
+    "timing_seconds": {
+      "upload": 1.304,
+      "classify": 1.184,
+      "frame_extraction": 1.222,
+      "event_extraction": 3.588,
+      "coaching": 1.082,
+      "total": 8.476
+    }
+  },
+  {
+    "is_league_of_legends": true,
+    "classification_confidence": 0.9822,
+    "classification_skipped": false,
+    "coaching": "{\n  \"good_plays\": [\n    {\n      \"text\": \"You followed up on your teammate's engagement by laying down an ability and staying active in the fight.\",\n      \"start_frame\": 7,\n      \"end_frame\": 11\n    }\n  ],\n  \"mistakes\": [\n    {\n      \"text\": \"You took damage during the team fight right after casting your initial ability, leaving you vulnerable as the skirmish progressed.\",\n      \"start_frame\": 9,\n      \"end_frame\": 13\n    }\n  ],\n  \"action_items\": {\n    \"keep_doing_this\": \"Look to cast your abilities and trade alongside your teammates when they initiate fights.\",\n    \"focus_on_this_next\": \"Pay closer attention to incoming damage and position more cautiously after committing your initial spells.\"\n  }\n}",
+    "timing_seconds": {
+      "upload": 0.136,
+      "classify": 1.547,
+      "frame_extraction": 2.118,
+      "event_extraction": 10.257,
+      "coaching": 1.095,
+      "total": 15.31
+    }
+  },
+  {
+    "is_league_of_legends": true,
+    "classification_confidence": 0.9822,
+    "classification_skipped": false,
+    "coaching": {
+      "good_plays": [
+        {
+          "text": "You followed up on the teamfight well by casting your cage ability to lock down the enemy.",
+          "start_frame": 17,
+          "end_frame": 24
+        }
+      ],
+      "mistakes": [
+        {
+          "text": "You stepped into the thick of the exchange and absorbed heavy damage before landing your major crowd control.",
+          "start_frame": 11,
+          "end_frame": 16
+        }
+      ],
+      "action_items": {
+        "keep_doing_this": "Look for opportunities to catch key targets with your cage ability during teamfights.",
+        "focus_on_this_next": "Wait for your teammates to initiate or look for safer positioning angles so you don't take unnecessary heavy damage before committing your spells."
+      }
+    },
+    "coaching_valid_json": true,
+    "timing_seconds": {
+      "upload": 0.141,
+      "classify": 1.604,
+      "frame_extraction": 2.183,
+      "event_extraction": 8.298,
+      "coaching": 1.329,
+      "total": 13.773
+    }
+  }
+]

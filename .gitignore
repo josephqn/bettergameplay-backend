@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+League of Legends 2026.08.29 - 00.57.53.02.DVR.mp4
+League of Legends 2026.08.29 - 00.57.53.02.DVR_trimmed.mp4
+League of Legends 2026.09.04 - 15.54.16.01.mp4
+
+.env
