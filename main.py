@@ -16,6 +16,27 @@ app = FastAPI()
 @app.middleware("http")
 async def log_http_requests(request, call_next):
     print(f"--> {request.method} {request.url.path}", flush=True)
+    original_receive = request.receive
+    body_started = False
+    body_bytes = 0
+
+    async def receive_with_diagnostics():
+        nonlocal body_started, body_bytes
+        message = await original_receive()
+        if message["type"] == "http.request":
+            chunk = message.get("body", b"")
+            body_bytes += len(chunk)
+            if not body_started and chunk:
+                body_started = True
+                print(
+                    f"HTTP BODY 1: first request body chunk received ({len(chunk)} bytes)",
+                    flush=True,
+                )
+            if not message.get("more_body", False):
+                print(f"HTTP BODY 2: request body complete ({body_bytes} bytes)", flush=True)
+        return message
+
+    request._receive = receive_with_diagnostics
     try:
         response = await call_next(request)
     except Exception:
