@@ -3,15 +3,19 @@ import os
 import tempfile
 import time
 from typing import List, Tuple
+from uuid import uuid4
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 
-from video_utils import FFmpegError, extract_frames_count, get_duration
+from very_good_service import VeryGoodVideoProcessor, validate_video_constraints
+from storage_service import R2ObjectStorage, StorageConfigurationError, StorageOperationError
 from gemini_pipeline import DEFAULT_MODEL, build_client, call_gemini_frames, parse_json_block
 
 NUM_FRAMES = 5
 LOL_THRESHOLD = 0.5
 CHUNK_SIZE = 1024 * 1024
+MAX_UPLOAD_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bettergameplay.classify")
@@ -66,7 +70,10 @@ confidence must be the arithmetic mean of per_frame_scores. Do not include markd
 
 
 @router.post("/api/video/classify")
-async def classify_video(video: UploadFile = File(None)):
+async def classify_video(
+    video: UploadFile = File(None),
+    duration: float = Form(..., description="Source video duration in seconds, read by the client before upload."),
+):
     request_start = time.perf_counter()
 
     if video is None or not video.filename:
@@ -75,32 +82,84 @@ async def classify_video(video: UploadFile = File(None)):
     input_suffix = os.path.splitext(video.filename)[1] or ".mp4"
     input_fd, input_path = tempfile.mkstemp(suffix=input_suffix)
     frames_dir = tempfile.mkdtemp()
+    video_processor = VeryGoodVideoProcessor.from_env()
+    if video_processor is None:
+        _cleanup(input_path, frames_dir)
+        raise HTTPException(status_code=500, detail="Very Good FFmpeg video processing is not configured")
+    try:
+        storage = R2ObjectStorage.from_env()
+    except StorageConfigurationError as exc:
+        _cleanup(input_path, frames_dir)
+        raise HTTPException(status_code=500, detail="Source video storage is not configured correctly") from exc
+    if storage is None:
+        _cleanup(input_path, frames_dir)
+        raise HTTPException(status_code=500, detail="Source video storage is not configured")
+    source_object_key = None
+
+    async def cleanup_source() -> None:
+        if source_object_key is not None:
+            try:
+                await run_in_threadpool(storage.delete_object, source_object_key)
+            except StorageOperationError:
+                logger.exception("classify: source video cleanup failed")
 
     upload_start = time.perf_counter()
     try:
+        total_bytes = 0
         with os.fdopen(input_fd, "wb") as f:
             while True:
                 chunk = await video.read(CHUNK_SIZE)
                 if not chunk:
                     break
+                total_bytes += len(chunk)
                 f.write(chunk)
     except Exception:
         logger.exception("failed to save uploaded video")
         _cleanup(input_path, frames_dir)
         raise HTTPException(status_code=500, detail="failed to save uploaded video")
     upload_time = time.perf_counter() - upload_start
+    if total_bytes > MAX_UPLOAD_FILE_SIZE_BYTES:
+        _cleanup(input_path, frames_dir)
+        raise HTTPException(status_code=400, detail="Video must be smaller than 2 GB.")
+    try:
+        validate_video_constraints(total_bytes, duration)
+    except ValueError as exc:
+        _cleanup(input_path, frames_dir)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        duration = get_duration(input_path)
-    except FFmpegError:
+        source_object_key = await run_in_threadpool(storage.upload_file, input_path, job_id=uuid4().hex)
+        source_url = await run_in_threadpool(storage.create_presigned_get_url, source_object_key)
+    except StorageOperationError as exc:
+        await cleanup_source()
         _cleanup(input_path, frames_dir)
-        raise HTTPException(status_code=500, detail="failed to read video")
+        raise HTTPException(status_code=502, detail="Source video storage failed") from exc
+    except Exception as exc:
+        logger.exception("failed to upload or inspect video with Very Good FFmpeg")
+        await cleanup_source()
+        _cleanup(input_path, frames_dir)
+        raise HTTPException(status_code=502, detail="Very Good FFmpeg could not access the source video") from exc
 
     extract_start = time.perf_counter()
-    frame_paths = extract_frames_count(input_path, frames_dir, NUM_FRAMES, duration)
+    try:
+        frame_paths = await run_in_threadpool(
+                video_processor.extract_frames,
+            source_url,
+            start_seconds=0.0,
+            duration_seconds=duration,
+            frame_count=NUM_FRAMES,
+            destination_dir=frames_dir,
+            max_width=256,
+        )
+    except Exception as exc:
+        logger.exception("failed to extract classification frames with Very Good FFmpeg")
+        await cleanup_source()
+        _cleanup(input_path, frames_dir)
+        raise HTTPException(status_code=502, detail=f"Very Good FFmpeg frame extraction failed: {exc}") from exc
     extract_time = time.perf_counter() - extract_start
 
     if not frame_paths:
+        await cleanup_source()
         _cleanup(input_path, frames_dir)
         raise HTTPException(status_code=500, detail="failed to extract frames")
 
@@ -109,10 +168,12 @@ async def classify_video(video: UploadFile = File(None)):
         confidence, per_frame_scores = classify_frames(frame_paths)
     except Exception:
         logger.exception("classification failed")
+        await cleanup_source()
         _cleanup(input_path, frames_dir)
         raise HTTPException(status_code=500, detail="failed to classify video")
     classify_time = time.perf_counter() - classify_start
 
+    await cleanup_source()
     _cleanup(input_path, frames_dir)
 
     total_time = time.perf_counter() - request_start

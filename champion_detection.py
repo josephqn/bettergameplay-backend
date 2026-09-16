@@ -1,6 +1,5 @@
 """champion_detection.py - given an uploaded video and a [start, end] window, extracts frames
-at the requested fps (same ffmpeg -ss/-t seek approach as analyze.py — frames come straight
-from the original upload, no intermediate trimmed file) and runs each one through the vision
+at the requested fps through Very Good FFmpeg and runs each one through the vision
 model, one frame per call, using the prompt from champion_detection_prompt(fps). Each frame's
 detected champions (id + normalized position) are returned alongside its timestamp; if a
 frame's response wasn't valid JSON, the raw model text is returned instead so nothing is lost.
@@ -17,12 +16,8 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from video_utils import (
-    FFmpegError,
-    check_ffmpeg_available,
-    extract_frames_fps,
-    get_duration,
-)
+from very_good_service import VeryGoodVideoProcessor, validate_video_constraints
+from storage_service import R2ObjectStorage, StorageConfigurationError, StorageOperationError
 from gemini_pipeline import DEFAULT_MODEL, build_client, call_gemini_frames, parse_json_block
 from prompts import champion_detection_prompt
 from champion_debug import draw_champion_debug_frame
@@ -34,13 +29,10 @@ MIN_CLIP_DURATION = 1.0
 DURATION_EPSILON = 0.05
 DETECTION_FPS = 2.0
 CHUNK_SIZE = 1024 * 1024
+MAX_UPLOAD_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024
 
-# Champion detection reads small UI elements (health bar color/position), which is far more
-# resolution-sensitive than the event/coaching pipeline's extract_frames_fps calls (which just
-# need enough detail for broad movement/combat patterns). Give this endpoint its own cap
-# instead of inheriting video_utils.ANALYSIS_FRAME_WIDTH, so raising it doesn't also make the
-# event/coaching pipeline more expensive. Like all max_width caps in video_utils, this never
-# upscales past the source resolution -- it only helps if the source is actually wider than this.
+# Champion detection reads small UI elements (health bar color/position), so it gets a larger
+# remote extraction cap than the event/coaching pipeline.
 CHAMPION_DETECTION_FRAME_WIDTH = 1536
 
 # Debug overlays land here, one subfolder per request, so runs don't clobber each other.
@@ -156,20 +148,32 @@ async def detect_champions(
     video: UploadFile = File(...),
     start: float = Form(...),
     end: float = Form(...),
+    duration: float = Form(..., description="Source video duration in seconds, read by the client before upload."),
     fps: float = Form(DETECTION_FPS),
     vision_model: str = Form(DEFAULT_MODEL),
     debug: bool = Form(True),
 ):
     request_start = time.perf_counter()
 
-    if not check_ffmpeg_available():
-        raise HTTPException(status_code=500, detail="ffmpeg/ffprobe not found on server")
+    video_processor = VeryGoodVideoProcessor.from_env()
+    if video_processor is None:
+        raise HTTPException(status_code=500, detail="Very Good FFmpeg video processing is not configured")
+    try:
+        storage = R2ObjectStorage.from_env()
+    except StorageConfigurationError as exc:
+        raise HTTPException(status_code=500, detail="Source video storage is not configured correctly") from exc
+    if storage is None:
+        raise HTTPException(status_code=500, detail="Source video storage is not configured")
     if not video.filename:
         raise HTTPException(status_code=400, detail="video is required")
     if start < 0:
         raise HTTPException(status_code=400, detail="start time must be >= 0")
     if end <= start:
         raise HTTPException(status_code=400, detail="end time must be greater than start time")
+    try:
+        validate_video_constraints(0, duration)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     clip_duration = end - start
     if clip_duration > MAX_CLIP_DURATION + DURATION_EPSILON:
@@ -196,47 +200,64 @@ async def detect_champions(
         logger.info("champion_detection: debug overlays will be saved to %s", debug_dir)
 
     timing: dict = {}
+    source_object_key: str | None = None
 
     try:
         # --- save upload ---
         logger.info("champion_detection: saving upload '%s' to %s", video.filename, input_path)
         upload_start = time.perf_counter()
+        total_bytes = 0
         try:
             with os.fdopen(input_fd, "wb") as f:
                 while True:
                     chunk = await video.read(CHUNK_SIZE)
                     if not chunk:
                         break
+                    total_bytes += len(chunk)
                     f.write(chunk)
         except Exception:
             logger.exception("failed to save uploaded video")
             raise HTTPException(status_code=500, detail="failed to save uploaded video")
         timing["upload"] = round(time.perf_counter() - upload_start, 3)
         logger.info("champion_detection: upload saved (%.2fs)", timing["upload"])
+        if total_bytes > MAX_UPLOAD_FILE_SIZE_BYTES:
+            raise HTTPException(status_code=400, detail="Video must be smaller than 2 GB.")
 
-        # --- make sure the requested window actually fits inside the source video ---
+        # --- upload to R2 and pass its URL to Very Good FFmpeg ---
         try:
-            source_duration = await run_in_threadpool(get_duration, input_path)
-        except FFmpegError as e:
-            logger.error("champion_detection: failed to read video duration: %s", e)
-            raise HTTPException(status_code=500, detail=f"failed to read video: {e}")
+            source_object_key = await run_in_threadpool(storage.upload_file, input_path, job_id=uuid.uuid4().hex)
+            source_url = await run_in_threadpool(storage.create_presigned_get_url, source_object_key)
+            source_duration = duration
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except StorageOperationError as e:
+            logger.exception("champion_detection: source storage operation failed")
+            raise HTTPException(status_code=502, detail="Source video storage failed") from e
+        except Exception as e:
+            logger.exception("champion_detection: failed to upload or inspect video with Very Good FFmpeg")
+            raise HTTPException(status_code=502, detail=f"Very Good FFmpeg video processing failed: {e}") from e
         if end > source_duration:
             raise HTTPException(
                 status_code=400,
                 detail=f"end time {end}s exceeds video duration {source_duration:.2f}s",
             )
 
-        # --- extract frames at the requested fps, straight from the [start, end] window ---
+        # --- extract frames at the requested fps from Very Good FFmpeg ---
         logger.info("champion_detection: extracting frames at %s fps...", fps)
         frame_extraction_start = time.perf_counter()
         try:
             frame_paths = await run_in_threadpool(
-                extract_frames_fps, input_path, frames_dir, fps, start, clip_duration,
-                CHAMPION_DETECTION_FRAME_WIDTH,
+                video_processor.extract_frames,
+                source_url,
+                start_seconds=start,
+                duration_seconds=clip_duration,
+                fps=fps,
+                destination_dir=frames_dir,
+                max_width=CHAMPION_DETECTION_FRAME_WIDTH,
             )
-        except FFmpegError as e:
-            logger.error("champion_detection: frame extraction failed: %s", e)
-            raise HTTPException(status_code=500, detail=f"frame extraction failed: {e}")
+        except Exception as e:
+            logger.error("champion_detection: Very Good FFmpeg frame extraction failed: %s", e)
+            raise HTTPException(status_code=502, detail=f"Very Good FFmpeg frame extraction failed: {e}")
         if not frame_paths:
             raise HTTPException(status_code=500, detail="no frames were extracted")
         timing["frame_extraction"] = round(time.perf_counter() - frame_extraction_start, 3)
@@ -275,6 +296,11 @@ async def detect_champions(
             debug_dir=debug_dir,
         )
     finally:
+        if source_object_key is not None:
+            try:
+                await run_in_threadpool(storage.delete_object, source_object_key)
+            except StorageOperationError:
+                logger.exception("champion_detection: source video cleanup failed")
         try:
             if os.path.exists(input_path):
                 os.remove(input_path)

@@ -5,33 +5,29 @@ through the two-stage Gemini coaching pipeline.
 
 This replaces calling /api/video/trim, /api/video/classify, and analyze_clip.py by hand in
 sequence: one upload, one response. Skipping the Gemini calls on non-LoL clips also saves you
-API cost on obviously-wrong uploads. There's no intermediate trimmed file: both frame-extraction
-passes seek straight into the original upload via ffmpeg -ss/-t, so we never pay for an extra
-re-encode + write/read round trip just to hand off to a second ffmpeg call.
+API cost on obviously-wrong uploads. All media probing and frame extraction runs through Very Good FFmpeg.
 """
 
 import logging
 import os
+import random
 import tempfile
 import time
+from uuid import uuid4
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from video_utils import (
-    FFmpegError,
-    check_ffmpeg_available,
-    extract_frames_count,
-    extract_frames_fps,
-    get_duration,
-)
-from classify import LOL_THRESHOLD, NUM_FRAMES, classify_frames
+from very_good_service import VeryGoodVideoProcessor, validate_video_constraints
+from storage_service import R2ObjectStorage, StorageConfigurationError, StorageOperationError
+from classify import LOL_THRESHOLD, classify_frames
 from gemini_pipeline import DEFAULT_MODEL, DEFAULT_TIMEOUT_SECONDS, GeminiRateLimitError, run_coaching_pipeline
 
 MAX_CLIP_DURATION = 20.0
 MIN_CLIP_DURATION = 1.0
+MAX_UPLOAD_FILE_SIZE_BYTES = 2 * 1024 * 1024 * 1024
 # Trim selections arrive as floats computed client-side (e.g. from a
 # percentage-of-duration drag), so an intended exactly-20s or exactly-1s
 # selection can arrive as 20.00000000000003 or 0.9999999999998. Give the
@@ -59,6 +55,7 @@ async def analyze_video(
     video: UploadFile = File(...),
     start: float = Form(...),
     end: float = Form(...),
+    duration: Optional[float] = Form(None, description="Source video duration in seconds, read by the client before upload."),
     fps: float = Form(ANALYSIS_FPS),
     vision_model: str = Form(DEFAULT_MODEL),
     text_model: str = Form(DEFAULT_MODEL),
@@ -80,14 +77,33 @@ async def analyze_video(
     request_start = time.perf_counter()
 
     print("ANALYZE 2: validating upload and request parameters", flush=True)
-    if not check_ffmpeg_available():
-        raise HTTPException(status_code=500, detail="ffmpeg/ffprobe not found on server")
+    video_processor = VeryGoodVideoProcessor.from_env()
+    if video_processor is None:
+        raise HTTPException(status_code=500, detail="Very Good FFmpeg video processing is not configured")
+    try:
+        storage = R2ObjectStorage.from_env()
+    except StorageConfigurationError as exc:
+        logger.error("source storage configuration is invalid: %s", exc)
+        raise HTTPException(status_code=500, detail="Source video storage is not configured correctly") from exc
+    if storage is None:
+        raise HTTPException(status_code=500, detail="Source video storage is not configured")
+    job_id = uuid4().hex
     if not video.filename:
         raise HTTPException(status_code=400, detail="video is required")
     if start < 0:
         raise HTTPException(status_code=400, detail="start time must be >= 0")
     if end <= start:
         raise HTTPException(status_code=400, detail="end time must be greater than start time")
+    if duration is not None:
+        if duration <= 0:
+            raise HTTPException(status_code=400, detail="Video duration must be greater than zero.")
+        try:
+            validate_video_constraints(file_size_bytes=0, duration_seconds=duration)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if video.size is not None and video.size > MAX_UPLOAD_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="Video must be smaller than 2 GB.")
 
     clip_duration = end - start
     if clip_duration > MAX_CLIP_DURATION + DURATION_EPSILON:
@@ -101,47 +117,63 @@ async def analyze_video(
             detail=f"requested clip must be at least {MIN_CLIP_DURATION:.0f}s",
         )
     # The tolerance above can let a hair-over selection (e.g. 20.03s) through;
-    # clamp it back to the actual bound so ffmpeg and the source-duration
-    # check downstream never see more than the limit.
+    # Clamp it back to the actual bound before remote processing.
     clip_duration = max(MIN_CLIP_DURATION, min(clip_duration, MAX_CLIP_DURATION))
     end = start + clip_duration
 
     input_suffix = os.path.splitext(video.filename)[1] or ".mp4"
     input_fd, input_path = tempfile.mkstemp(suffix=input_suffix)
-    classify_frames_dir = None if skip_classification else tempfile.mkdtemp(prefix="classify_frames_")
     analysis_frames_dir = tempfile.mkdtemp(prefix="analysis_frames_")
 
     timing: dict = {}
+    source_object_key: Optional[str] = None
 
     try:
         print("ANALYZE 3: upload received; saving video", flush=True)
         # --- save upload ---
         logger.info("analyze: saving uploaded video to temporary storage")
         upload_start = time.perf_counter()
+        total_bytes = 0
         try:
             with os.fdopen(input_fd, "wb") as f:
                 while True:
                     chunk = await video.read(CHUNK_SIZE)
                     if not chunk:
                         break
+                    total_bytes += len(chunk)
                     f.write(chunk)
         except Exception:
             logger.exception("failed to save uploaded video")
             raise HTTPException(status_code=500, detail="failed to save uploaded video")
+        if total_bytes > MAX_UPLOAD_FILE_SIZE_BYTES:
+            raise HTTPException(status_code=400, detail="Video must be smaller than 2 GB.")
+        logger.info("STORAGE 1: validated video")
         timing["upload"] = round(time.perf_counter() - upload_start, 3)
         print(f"ANALYZE 4: video saved ({timing['upload']:.2f}s)", flush=True)
         logger.info("analyze: upload saved (%.2fs)", timing["upload"])
 
-        # --- make sure the requested window actually fits inside the source video ---
-        print("ANALYZE 5: starting FFmpeg/video duration probe", flush=True)
-        logger.info("analyze: reading source video duration...")
+        # --- upload to private R2 and pass its URL to Very Good FFmpeg ---
+        print("ANALYZE 5: uploading video to object storage", flush=True)
+        source_storage_start = time.perf_counter()
         try:
-            source_duration = await run_in_threadpool(get_duration, input_path)
-        except FFmpegError as e:
-            logger.error("analyze: failed to read video duration: %s", e)
-            raise HTTPException(status_code=500, detail=f"failed to read video: {e}")
+            source_object_key = await run_in_threadpool(storage.upload_file, input_path, job_id=job_id)
+            source_url = await run_in_threadpool(storage.create_presigned_get_url, source_object_key)
+            # Older clients do not send duration. Keep the existing API usable;
+            # updated clients provide the browser-measured duration for the
+            # complete 10-minute validation.
+            source_duration = duration if duration is not None else end
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except StorageOperationError as e:
+            logger.exception("analyze: source storage operation failed")
+            raise HTTPException(status_code=502, detail="Source video storage failed") from e
+        except Exception as e:
+            logger.exception("analyze: failed to create Very Good FFmpeg-accessible source URL")
+            raise HTTPException(status_code=502, detail="Source video storage failed") from e
+        timing["source_storage"] = round(time.perf_counter() - source_storage_start, 3)
+        logger.info("perf analyze: source storage handoff=%.2fs", timing["source_storage"])
         logger.info("analyze: source duration=%.2fs, requested window=%.2fs-%.2fs", source_duration, start, end)
-        print(f"ANALYZE 6: FFmpeg/video duration probe complete ({source_duration:.2f}s)", flush=True)
+        print(f"ANALYZE 6: source duration validated ({source_duration:.2f}s)", flush=True)
         if end > source_duration + DURATION_EPSILON:
             raise HTTPException(
                 status_code=400,
@@ -149,9 +181,9 @@ async def analyze_video(
             )
         # As with the MAX/MIN clip-duration clamp above, the epsilon can let an
         # `end` that's a hair past the true source duration (float rounding from
-        # the client, or ffprobe reporting slightly short) through the check
-        # above. Clamp it back so neither ffmpeg seek below ever asks for frames
-        # past the actual end of the source file.
+        # the client, or remote metadata reporting slightly short) through the check
+        # above. Clamp it back so remote extraction never asks for frames past
+        # the actual end of the source file.
         if end > source_duration:
             end = source_duration
             clip_duration = end - start
@@ -161,57 +193,58 @@ async def analyze_video(
                     detail=f"requested clip must be at least {MIN_CLIP_DURATION:.0f}s",
                 )
 
-        # --- classify with Gemini before running the coaching pipeline ---
+        # --- extract the single shared frame set used by classification and event analysis ---
+        print("ANALYZE 7: extracting analysis frames", flush=True)
+        logger.info("analyze: extracting analysis frames at %.2f FPS for Gemini...", fps)
+        frame_extraction_start = time.perf_counter()
+        try:
+            analysis_paths = await run_in_threadpool(
+                video_processor.extract_frames,
+                source_url,
+                start_seconds=start,
+                duration_seconds=clip_duration,
+                fps=fps,
+                destination_dir=analysis_frames_dir,
+                max_width=1024,
+            )
+        except Exception as e:
+            logger.error("analyze: Very Good FFmpeg frame extraction failed: %s", e)
+            raise HTTPException(status_code=502, detail=f"Very Good FFmpeg frame extraction failed: {e}")
+        if not analysis_paths:
+            raise HTTPException(status_code=500, detail="no frames were extracted for analysis")
+        timing["frame_extraction"] = round(time.perf_counter() - frame_extraction_start, 3)
+        print(f"ANALYZE 8: analysis frames extracted ({len(analysis_paths)} frames)", flush=True)
+        logger.info(
+            "perf analyze: Very Good frame extraction=%.2fs frames=%d",
+            timing["frame_extraction"], len(analysis_paths),
+        )
+
+        # --- classify one random analysis frame with Gemini ---
         # Skippable when the caller already classified this clip (e.g. via /api/video/classify)
-        # to avoid classifying the same footage twice.
-        # Frames are pulled directly from the [start, end] window of the original upload --
-        # no intermediate trimmed file is created; ffmpeg seeks straight to each timestamp.
+        # to avoid running the classification call twice.
         confidence: Optional[float] = None
         if skip_classification:
             timing["classify"] = 0.0
-            print("ANALYZE 7: classification skipped by request", flush=True)
+            print("ANALYZE 9: classification skipped by request", flush=True)
             logger.info("analyze: skipping classification (skip_classification=true)")
         else:
-            print("ANALYZE 7: extracting classification frames", flush=True)
-            logger.info("analyze: extracting %d frames for classification...", NUM_FRAMES)
-            classify_extract_start = time.perf_counter()
-            classify_paths = await run_in_threadpool(
-                extract_frames_count,
-                input_path,
-                classify_frames_dir,
-                NUM_FRAMES,
-                clip_duration,
-                start,
-            )
-            classify_extract_seconds = time.perf_counter() - classify_extract_start
-            if not classify_paths:
-                raise HTTPException(status_code=500, detail="failed to extract frames for classification")
-            logger.info(
-                "perf analyze: classification frame extraction=%.2fs frames=%d",
-                classify_extract_seconds, len(classify_paths),
-            )
-            print(
-                f"ANALYZE 8: classification frames extracted ({len(classify_paths)} frames, "
-                f"{classify_extract_seconds:.2f}s)",
-                flush=True,
-            )
-            logger.info("analyze: running Gemini classification on %d frames...", len(classify_paths))
+            classification_frame = random.choice(analysis_paths)
+            logger.info("analyze: classifying one random analysis frame: %s", os.path.basename(classification_frame))
             try:
-                print("ANALYZE 9: starting Gemini classification call", flush=True)
+                print("ANALYZE 10: starting Gemini classification call", flush=True)
                 classify_call_start = time.perf_counter()
-                confidence, _per_frame = await run_in_threadpool(classify_frames, classify_paths)
+                confidence, _per_frame = await run_in_threadpool(classify_frames, [classification_frame])
             except Exception:
                 logger.exception("classification failed")
                 raise HTTPException(status_code=500, detail="failed to classify video")
             classify_call_seconds = time.perf_counter() - classify_call_start
-            timing["classify"] = round(classify_extract_seconds + classify_call_seconds, 3)
+            timing["classify"] = round(classify_call_seconds, 3)
             logger.info(
-                "perf analyze: Gemini classification call=%.2fs total_classify=%.2fs confidence=%.4f",
-                classify_call_seconds, timing["classify"], confidence,
+                "perf analyze: Gemini one-frame classification=%.2fs confidence=%.4f",
+                timing["classify"], confidence,
             )
             print(
-                f"ANALYZE 10: Gemini classification complete (call={classify_call_seconds:.2f}s, "
-                f"total={timing['classify']:.2f}s)",
+                f"ANALYZE 11: Gemini classification complete ({timing['classify']:.2f}s)",
                 flush=True,
             )
             logger.info("analyze: classification complete (%.2fs, confidence=%.4f)", timing["classify"], confidence)
@@ -219,42 +252,23 @@ async def analyze_video(
             if confidence < LOL_THRESHOLD:
                 timing["total"] = round(time.perf_counter() - request_start, 3)
                 logger.info("analyze: clip rejected, not League of Legends (confidence=%.4f)", confidence)
-                print("ANALYZE 11: clip rejected during classification", flush=True)
+                print("ANALYZE 12: clip rejected during classification", flush=True)
                 rejected_response = AnalyzeResponse(
                     is_league_of_legends=False,
                     classification_confidence=round(confidence, 4),
                     timing_seconds=timing,
                 )
-                print("ANALYZE 12: rejection response created", flush=True)
+                print("ANALYZE 13: rejection response created", flush=True)
                 return rejected_response
 
         # --- Gemini coaching pipeline (only reached for clips that passed classification) ---
-        print("ANALYZE 11: extracting analysis frames", flush=True)
-        logger.info("analyze: extracting frames for Gemini analysis at %s fps...", fps)
-        frame_extraction_start = time.perf_counter()
-        try:
-            analysis_paths = await run_in_threadpool(
-                extract_frames_fps,
-                input_path,
-                analysis_frames_dir,
-                fps,
-                start,
-                clip_duration,
-            )
-        except FFmpegError as e:
-            logger.error("analyze: frame extraction for analysis failed: %s", e)
-            raise HTTPException(status_code=500, detail=f"frame extraction for analysis failed: {e}")
-        if not analysis_paths:
-            raise HTTPException(status_code=500, detail="no frames were extracted for analysis")
-        timing["frame_extraction"] = round(time.perf_counter() - frame_extraction_start, 3)
-        print(f"ANALYZE 12: analysis frames extracted ({len(analysis_paths)} frames)", flush=True)
+        print("ANALYZE 13: starting Gemini coaching pipeline", flush=True)
         logger.info(
             "analyze: extracted %d frames for analysis (%.2fs), starting Gemini pipeline (vision=%s, text=%s)...",
             len(analysis_paths), timing["frame_extraction"], vision_model, text_model,
         )
 
         try:
-            print("ANALYZE 13: starting Gemini coaching pipeline", flush=True)
             result = await run_in_threadpool(
                 run_coaching_pipeline, analysis_paths, fps, vision_model, text_model, gemini_timeout_seconds
             )
@@ -301,14 +315,17 @@ async def analyze_video(
         logger.exception("analyze: unhandled exception")
         raise
     finally:
+        if source_object_key is not None:
+            try:
+                await run_in_threadpool(storage.delete_object, source_object_key)
+            except StorageOperationError:
+                logger.exception("analyze: source video cleanup failed")
         try:
             if os.path.exists(input_path):
                 os.remove(input_path)
         except OSError:
             logger.warning("failed to remove temp file: %s", input_path)
-        for d in (classify_frames_dir, analysis_frames_dir):
-            if d is None:
-                continue
+        for d in (analysis_frames_dir,):
             try:
                 for name in os.listdir(d):
                     os.remove(os.path.join(d, name))

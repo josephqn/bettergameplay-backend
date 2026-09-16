@@ -14,7 +14,7 @@ Usage:
     uv run analyze_clip.py clip.mp4 --fps 2
     uv run analyze_clip.py clip.mp4 --fps 2 --keep-frames
 
-Requires ffmpeg/ffprobe on PATH and a GEMINI_API_KEY environment variable
+Requires VERY_GOOD_API_KEY and a GEMINI_API_KEY environment variable
 (get one at https://aistudio.google.com/apikey).
 """
 
@@ -26,10 +26,12 @@ import shutil
 import sys
 import tempfile
 import time
+from uuid import uuid4
 
 from dotenv import find_dotenv, load_dotenv
 
-from video_utils import FFmpegError, check_ffmpeg_available, extract_frames_fps, get_duration
+from very_good_service import VeryGoodVideoProcessor, validate_video_constraints
+from storage_service import R2ObjectStorage, StorageConfigurationError, StorageOperationError
 from gemini_pipeline import DEFAULT_MODEL, run_coaching_pipeline
 
 load_dotenv(find_dotenv(usecwd=True))  # reads a .env file in the current working directory (if present)
@@ -49,6 +51,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fps", type=float, default=DEFAULT_FPS,
         help=f"Frames per second to sample from the clip (default {DEFAULT_FPS})",
+    )
+    parser.add_argument(
+        "--duration", type=float, required=True,
+        help="Source video duration in seconds, measured before upload",
     )
     parser.add_argument(
         "--vision-model", default=DEFAULT_MODEL,
@@ -78,17 +84,47 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    if not check_ffmpeg_available():
-        logger.error("ffmpeg/ffprobe not found on PATH.")
+    video_processor = VeryGoodVideoProcessor.from_env()
+    if video_processor is None:
+        logger.error("VERY_GOOD_API_KEY is not configured.")
         return 1
     if not os.path.isfile(args.video):
         logger.error("video file not found: %s", args.video)
         return 1
 
     try:
-        duration = get_duration(args.video)
-    except FFmpegError as e:
-        logger.error("failed to read video duration: %s", e)
+        storage = R2ObjectStorage.from_env()
+    except StorageConfigurationError as e:
+        logger.error("source storage is not configured correctly: %s", e)
+        return 1
+    if storage is None:
+        logger.error("source storage is not configured")
+        return 1
+
+    user_supplied_frames_dir = args.frames_dir is not None
+    frames_dir = args.frames_dir or tempfile.mkdtemp(prefix="analyze_clip_frames_")
+    os.makedirs(frames_dir, exist_ok=True)
+    source_object_key = None
+
+    def cleanup_source() -> None:
+        if source_object_key is not None:
+            try:
+                storage.delete_object(source_object_key)
+            except StorageOperationError:
+                logger.exception("source video cleanup failed")
+
+    try:
+        source_object_key = storage.upload_file(args.video, job_id=uuid4().hex)
+        source_url = storage.create_presigned_get_url(source_object_key)
+        duration = args.duration
+        validate_video_constraints(os.path.getsize(args.video), duration)
+    except ValueError as e:
+        logger.error("video rejected: %s", e)
+        cleanup_source()
+        return 1
+    except Exception as e:
+        logger.error("failed to upload or inspect video with Very Good FFmpeg: %s", e)
+        cleanup_source()
         return 1
 
     logger.info("video duration: %.2fs", duration)
@@ -97,17 +133,21 @@ def main() -> int:
             "video is %.2fs, which exceeds the %.0fs limit. Trim it first.",
             duration, MAX_DURATION_SECONDS,
         )
+        cleanup_source()
         return 1
-
-    user_supplied_frames_dir = args.frames_dir is not None
-    frames_dir = args.frames_dir or tempfile.mkdtemp(prefix="analyze_clip_frames_")
-    os.makedirs(frames_dir, exist_ok=True)
 
     total_start = time.perf_counter()
     try:
         logger.info("extracting frames at %s fps...", args.fps)
         extract_start = time.perf_counter()
-        frame_paths = extract_frames_fps(args.video, frames_dir, args.fps)
+        frame_paths = video_processor.extract_frames(
+            source_url,
+            start_seconds=0.0,
+            duration_seconds=duration,
+            fps=args.fps,
+            destination_dir=frames_dir,
+            max_width=1024,
+        )
         extract_seconds = time.perf_counter() - extract_start
         if not frame_paths:
             logger.error("no frames were extracted")
@@ -153,6 +193,7 @@ def main() -> int:
 
         return 0
     finally:
+        cleanup_source()
         if not user_supplied_frames_dir:
             if args.keep_frames:
                 logger.info("frames kept at %s", frames_dir)
