@@ -1,0 +1,14 @@
+.env
+.env.*
+.venv/
+.venv*/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+build/
+dist/
+*.egg-info/
+*.mp4
+champions_debug/
+tests/

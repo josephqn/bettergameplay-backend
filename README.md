@@ -1,6 +1,13 @@
 # Run the API locally
 
-uv run uvicorn main:app --reload --host 127.0.0.1 --port 8000
+uv run uvicorn main:app --reload --host 0.0.0.0 --port $PORT
+
+# Run with Docker / Cloud Run
+
+docker build -t bettergame-backend .
+docker run --rm -p 8080:8080 -e PORT=8080 bettergame-backend
+
+# Cloud Run injects PORT automatically; the container listens on 0.0.0.0:$PORT.
 
 # Very Good FFmpeg configuration
 
@@ -64,7 +71,7 @@ uv run uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 # Health check:
 
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:$PORT/health
 
 uv run roboflow_champion_detector.py "League of Legends 2026.08.29 - 00.57.53.02.DVR_trimmed.mp4" --confidence 0.15 --frames 20
 
